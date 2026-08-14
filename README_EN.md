@@ -10,7 +10,7 @@
 
 # DSH Local Project
 
-> Import a local folder as a server-DSH workspace (the server keeps a mirror copy) with **two-way sync** — edits in DSH sync back to your local folder, and local edits sync up. Deleting a project removes only the server copy. Modeled after Grok's web "New project".
+> Import a local folder as a server-DSH workspace (the server keeps a mirror copy). **Files sync back to your local folder only when DSH modifies them** (server `fs.watch` + browser pull) — no continuous two-way sync. Deleting a project removes only the server copy. Modeled after Grok's web "New project".
 
 **Install:**
 
@@ -24,10 +24,7 @@ Restart DSH, then use the "Local project" button at the sidebar bottom.
 
 1. In the browser, click "Local project" → pick a local folder (File System Access API grants a read/write handle).
 2. The folder is **uploaded to the server** as a real workspace directory, so DSH's native `read/write/edit/glob/bash` tools work directly — no custom tools needed.
-3. **Two-way sync** (driven by the browser every 5 s):
-   - Server (DSH) changes → downloaded to local.
-   - Local changes → uploaded to server.
-   - Same file changed on both sides → the newer modification time wins.
+3. **Pull-only sync (DSH → local)**: the server watches the project directory with `fs.watch`; whenever DSH changes a file it records the change, and the browser does a lightweight poll (every 2 s) and downloads those files to local. Local edits are not auto-uploaded, and local files are not scanned continuously.
 4. **Deleting a project** removes only the server copy and workspace record; local files are untouched (individual file deletions are not propagated, to avoid accidental data loss).
 
 ## Usage
@@ -42,21 +39,23 @@ Restart DSH, then use the "Local project" button at the sidebar bottom.
 - **Requires the File System Access API**: Chrome / Edge (Chromium-based). Firefox / Safari are not supported.
 - **~15 MB per-file cap** (upload uses base64 JSON); keep very large files out of the project.
 - **No single-file delete propagation**: only "delete project" removes the whole server copy.
-- **5-second sync interval**: changes sync within 5 s; very large projects make the full scan slower.
+- **Local edits are not auto-uploaded**: only the initial import uploads; afterwards the server mirror follows DSH's changes.
+- **~2 s change poll**: DSH changes reach your local folder within ~2 s; the poll only checks a change number, it does not scan local files.
 - **Electron desktop window**: if the API is unavailable, open DSH's web address in a system browser.
 
 ## Architecture
 
 - **Host half** (`src/index.ts` → `lib/index.js`):
   - `POST /local-project/create`: creates the server directory + workspace record.
-  - `POST /local-project/upload`: writes/overwrites a server file (base64, binary-safe).
-  - `GET /local-project/manifest`: returns `{ size, mtimeMs }` for every server file (for sync diffing).
-  - `GET /local-project/download`: reads a server file (base64).
+  - `POST /local-project/upload`: writes/overwrites a server file (base64, binary-safe; used by the initial import).
+  - `GET /local-project/rev`: returns the project change number (for the browser's lightweight poll).
+  - `GET /local-project/pull`: returns the paths DSH changed since the last pull.
+  - `GET /local-project/manifest` / `download`: full reconcile / download a file (base64).
   - `POST /local-project/delete`: removes the server directory + workspace record.
 - **Client half** (`src/client/index.tsx` → `lib/client.js`):
   - Registers the "Local project" button + import dialog in `sidebar.footer.action`.
   - Holds the local folder read/write handles (browser memory only).
-  - Every 5 s builds a local manifest, fetches the server manifest, and applies two-way diffs (signed by size+mtime to avoid loops).
+  - Uploads all files on the initial import, then polls `rev` every 2 s and pulls any DSH-changed files back to local (driven by `fs.watch`; no local scanning, no continuous two-way sync).
   - "Delete project" calls the server delete endpoint and drops the local handle.
 
 ## Configuration (environment variables)

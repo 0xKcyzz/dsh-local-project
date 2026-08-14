@@ -1,10 +1,12 @@
-// Host half of dsh-local-project (Grok-style model): the user's local folder is
-// mirrored into a real server workspace directory, and the browser keeps the
-// two sides in two-way sync. DSH's native file tools operate on the server
-// copy as a normal workspace. Deleting a project removes only the server copy.
+// Host half of dsh-local-project (Grok-style model, pull-only sync): the user's
+// local folder is mirrored into a real server workspace directory at import.
+// Afterwards the server watches that directory with fs.watch; when DSH modifies
+// files there, the browser pulls those changes down to the local folder. There
+// is no continuous two-way sync — local edits are not auto-uploaded.
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, watch } from 'node:fs'
+import type { FSWatcher } from 'node:fs'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -24,6 +26,13 @@ interface Ctx {
   logger?: { warn(msg: unknown): void; error(msg: unknown): void }
 }
 
+interface ProjectWatcher {
+  rev: number
+  pathRev: Map<string, number>
+  fullDirtyRev: number
+  watcher: FSWatcher | null
+}
+
 function dshHome(): string {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
 }
@@ -38,7 +47,6 @@ function sanitizeName(name: unknown): string {
   return s
 }
 
-/** Sanitize a relative path and confirm it stays inside the project dir. */
 function safeTarget(dir: string, rel: unknown): string | null {
   if (typeof rel !== 'string') return null
   const s = rel.replace(/\\/g, '/')
@@ -80,7 +88,6 @@ function readJson(req: IncomingMessage, maxBytes: number): Promise<Record<string
   })
 }
 
-/** Recursively collect `{ relPath: { size, mtimeMs } }` for every file in dir. */
 function walkFiles(dir: string, base: string, out: Record<string, { size: number; mtimeMs: number }>): void {
   let entries: import('node:fs').Dirent[]
   try {
@@ -104,11 +111,50 @@ function walkFiles(dir: string, base: string, out: Record<string, { size: number
   }
 }
 
-function sigOf(size: number, mtimeMs: number): string {
-  return `${size}:${Math.floor(mtimeMs)}`
-}
-
 export function apply(ctx: Ctx) {
+  const watchers = new Map<string, ProjectWatcher>()
+
+  function ensureWatcher(name: string, dir: string): void {
+    if (watchers.has(name)) return
+    const w: ProjectWatcher = { rev: 0, pathRev: new Map(), fullDirtyRev: 0, watcher: null }
+    try {
+      w.watcher = watch(dir, { recursive: true }, (event, filename) => {
+        w.rev++
+        if (filename) w.pathRev.set(String(filename).replace(/\\/g, '/'), w.rev)
+        else w.fullDirtyRev = w.rev
+      })
+    } catch {
+      w.watcher = null
+    }
+    watchers.set(name, w)
+  }
+
+  function stopWatcher(name: string): void {
+    const w = watchers.get(name)
+    if (w) {
+      try {
+        w.watcher?.close()
+      } catch {
+        // ignore
+      }
+      watchers.delete(name)
+    }
+  }
+
+  ctx.effect(
+    () => () => {
+      for (const w of watchers.values()) {
+        try {
+          w.watcher?.close()
+        } catch {
+          // ignore
+        }
+      }
+      watchers.clear()
+    },
+    'local-project: watchers cleanup',
+  )
+
   ctx.effect(
     () =>
       ctx.webServer.register({
@@ -136,6 +182,7 @@ export function apply(ctx: Ctx) {
               if (!existing) {
                 await ctx.workspaceRegistry.create(dir, `本地项目: ${name}`)
               }
+              ensureWatcher(name, dir)
               sendJson(res, 200, { ok: true, name })
               return
             }
@@ -152,8 +199,36 @@ export function apply(ctx: Ctx) {
               }
               mkdirSync(dirname(target), { recursive: true })
               writeFileSync(target, Buffer.from(content, 'base64'))
-              const st = statSync(target)
-              sendJson(res, 200, { ok: true, sig: sigOf(st.size, st.mtimeMs) })
+              sendJson(res, 200, { ok: true })
+              return
+            }
+
+            if (pathname === '/local-project/rev' && req.method === 'GET') {
+              const name = sanitizeName(url.searchParams.get('name'))
+              if (!name) {
+                sendJson(res, 400, { ok: false, error: '参数无效' })
+                return
+              }
+              const rev = watchers.get(name)?.rev ?? 0
+              sendJson(res, 200, { ok: true, rev })
+              return
+            }
+
+            if (pathname === '/local-project/pull' && req.method === 'GET') {
+              const name = sanitizeName(url.searchParams.get('name'))
+              if (!name) {
+                sendJson(res, 400, { ok: false, error: '参数无效' })
+                return
+              }
+              const since = Number(url.searchParams.get('since') ?? 0) || 0
+              const w = watchers.get(name)
+              const rev = w?.rev ?? 0
+              const paths: string[] = []
+              if (w) {
+                for (const [p, r] of w.pathRev) if (r > since) paths.push(p)
+              }
+              const full = (w?.fullDirtyRev ?? 0) > since
+              sendJson(res, 200, { ok: true, rev, paths, full })
               return
             }
 
@@ -179,12 +254,7 @@ export function apply(ctx: Ctx) {
                 return
               }
               const buf = readFileSync(target)
-              const st = statSync(target)
-              sendJson(res, 200, {
-                ok: true,
-                content: buf.toString('base64'),
-                sig: sigOf(st.size, st.mtimeMs),
-              })
+              sendJson(res, 200, { ok: true, content: buf.toString('base64') })
               return
             }
 
@@ -196,6 +266,7 @@ export function apply(ctx: Ctx) {
                 return
               }
               const dir = join(rootDir(), name)
+              stopWatcher(name)
               try {
                 const ws = await ctx.workspaceRegistry.resolveByPath(dir)
                 if (ws) await ctx.workspaceRegistry.delete(ws.id)
