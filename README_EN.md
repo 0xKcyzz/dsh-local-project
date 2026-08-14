@@ -10,7 +10,7 @@
 
 # DSH Local Project
 
-> Let a **server-deployed DSH** read and write files on your **local computer** directly: click "Local project" at the bottom of the sidebar, pick a local folder, and the DSH uses the `local_*` tools to operate on your real local files — relayed through the browser, with **no upload and no server-side copy**.
+> Import a local folder as a server-DSH workspace (the server keeps a mirror copy) with **two-way sync** — edits in DSH sync back to your local folder, and local edits sync up. Deleting a project removes only the server copy. Modeled after Grok's web "New project".
 
 **Install:**
 
@@ -18,61 +18,52 @@
 dsh plugin --profile web add github:w769721503/dsh-local-project
 ```
 
-Restart DSH, then use the "Local project" button at the bottom of the sidebar.
+Restart DSH, then use the "Local project" button at the sidebar bottom.
 
-## How it works
+## How it works (Grok model)
 
-DSH's built-in file tools (`fs`/`bash`) operate on **server paths** and cannot reach your local disk. This plugin uses the **browser as a local file agent**:
-
-1. In the browser, click "Local project" → pick a local folder (File System Access API grants a **read/write handle** that lives only in your browser).
-2. The server registers a "Local project: <name>" workspace and 4 `local_*` tools.
-3. Chat in that workspace; the model calls `local_read / local_write / local_list / local_delete`.
-4. The server **enqueues** each file operation; the browser polls every 400 ms, executes it against the local folder, and reports the result back.
-
-No file content is uploaded; no server-side copy is kept — the server only receives "file name + operation", and the actual read/write happens on your local disk.
-
-## Operations
-
-| Tool | Purpose |
-|---|---|
-| `local_list(project, path)` | List files/folders inside the local project |
-| `local_read(project, path)` | Read a local UTF-8 text file |
-| `local_write(project, path, content)` | Write/overwrite a local text file (creates missing directories) |
-| `local_delete(project, path)` | Delete a local file or folder |
+1. In the browser, click "Local project" → pick a local folder (File System Access API grants a read/write handle).
+2. The folder is **uploaded to the server** as a real workspace directory, so DSH's native `read/write/edit/glob/bash` tools work directly — no custom tools needed.
+3. **Two-way sync** (driven by the browser every 5 s):
+   - Server (DSH) changes → downloaded to local.
+   - Local changes → uploaded to server.
+   - Same file changed on both sides → the newer modification time wins.
+4. **Deleting a project** removes only the server copy and workspace record; local files are untouched (individual file deletions are not propagated, to avoid accidental data loss).
 
 ## Usage
 
 1. After restart, click "📁 Local project" at the sidebar bottom.
-2. Enter a project name → "Choose folder & connect" → select a local folder (Chrome/Edge asks for access permission).
-3. A "Local project: <name>" workspace appears in the sidebar.
-4. Open that workspace and chat — the model automatically uses the `local_*` tools on your local files.
+2. Enter a project name → "Choose folder & import" → select a local folder (Chrome/Edge grants access).
+3. The initial upload starts; a "Local project: <name>" workspace appears in the sidebar.
+4. Open that workspace and chat — DSH operates on the server mirror, and changes sync back to your local folder.
 
 ## Limitations
 
 - **Requires the File System Access API**: Chrome / Edge (Chromium-based). Firefox / Safari are not supported.
-- **Text files only**: `local_read`/`local_write` treat content as UTF-8 text; binary files (images, archives) will be corrupted — do not use for binaries.
-- **No local shell**: browser sandbox cannot run local commands; a local helper program would be needed for that.
-- **Keep the browser tab open**: file operations are relayed by the page; closing it makes `local_*` return "local agent unresponsive".
-- **Electron desktop window**: if the API is unavailable, open DSH's web address in a system browser instead.
+- **~15 MB per-file cap** (upload uses base64 JSON); keep very large files out of the project.
+- **No single-file delete propagation**: only "delete project" removes the whole server copy.
+- **5-second sync interval**: changes sync within 5 s; very large projects make the full scan slower.
+- **Electron desktop window**: if the API is unavailable, open DSH's web address in a system browser.
 
 ## Architecture
 
 - **Host half** (`src/index.ts` → `lib/index.js`):
-  - Registers the 4 `local_*` model tools (via `defineTool` from `@deepseek-ai/dsh-tools`).
-  - `/local-project/register`: creates a placeholder workspace and registers the project.
-  - `/local-project/ops`: the browser polls for the next pending operation.
-  - `/local-project/result`: the browser reports the result, waking the waiting tool call.
-  - `systemPrompt.section`: instructs the model to use `local_*` tools in "Local project" workspaces.
+  - `POST /local-project/create`: creates the server directory + workspace record.
+  - `POST /local-project/upload`: writes/overwrites a server file (base64, binary-safe).
+  - `GET /local-project/manifest`: returns `{ size, mtimeMs }` for every server file (for sync diffing).
+  - `GET /local-project/download`: reads a server file (base64).
+  - `POST /local-project/delete`: removes the server directory + workspace record.
 - **Client half** (`src/client/index.tsx` → `lib/client.js`):
-  - Registers the "Local project" button + connect dialog in `sidebar.footer.action`.
+  - Registers the "Local project" button + import dialog in `sidebar.footer.action`.
   - Holds the local folder read/write handles (browser memory only).
-  - Polls `/local-project/ops` and executes operations via the File System Access API.
+  - Every 5 s builds a local manifest, fetches the server manifest, and applies two-way diffs (signed by size+mtime to avoid loops).
+  - "Delete project" calls the server delete endpoint and drops the local handle.
 
 ## Configuration (environment variables)
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `DSH_LOCAL_PROJECT_ROOT` | `$DSH_HOME/workspaces` | Directory for placeholder workspaces (real files never live here). |
+| `DSH_LOCAL_PROJECT_ROOT` | `$DSH_HOME/workspaces` | Server mirror directory for local projects. |
 
 ## Development / build
 

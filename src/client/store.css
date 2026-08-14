@@ -97,6 +97,11 @@
   background: transparent;
   color: var(--dsw-alias-label-primary, #eee);
 }
+.lp-danger {
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary, #e5534b) 50%, transparent);
+  background: transparent;
+  color: var(--dsw-alias-state-error-primary, #e5534b);
+}
 .lp-projects {
   margin: 0;
   padding: 0;
