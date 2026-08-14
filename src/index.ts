@@ -9,6 +9,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import type { FSWatcher } from 'node:fs'
 import { dirname, join, normalize, relative, sep } from 'node:path'
 import { homedir } from 'node:os'
+import { WebSocketServer } from 'ws'
+import type { WebSocket } from 'ws'
 
 export const name = 'dsh-local-project'
 export const inject = ['webServer', 'workspaceRegistry']
@@ -16,6 +18,10 @@ export const inject = ['webServer', 'workspaceRegistry']
 interface Ctx {
   webServer: {
     register(route: { kind: string; path: string; handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void
+    registerUpgrade(route: {
+      path: string
+      handler: (req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => void | Promise<void>
+    }): () => void
   }
   workspaceRegistry: {
     create(path: string, title?: string): Promise<{ id: string; path: string; title: string }>
@@ -113,6 +119,23 @@ function walkFiles(dir: string, base: string, out: Record<string, { size: number
 
 export function apply(ctx: Ctx) {
   const watchers = new Map<string, ProjectWatcher>()
+  const sockets = new Map<string, Set<WebSocket>>()
+  const wss = new WebSocketServer({ noServer: true })
+
+  function broadcast(name: string, msg: unknown): void {
+    const set = sockets.get(name)
+    if (!set || set.size === 0) return
+    const data = JSON.stringify(msg)
+    for (const ws of set) {
+      if (ws.readyState === 1 /* OPEN */) {
+        try {
+          ws.send(data)
+        } catch {
+          // ignore a dead socket; its close handler cleans up
+        }
+      }
+    }
+  }
 
   function ensureWatcher(name: string, dir: string): void {
     if (watchers.has(name)) return
@@ -120,8 +143,16 @@ export function apply(ctx: Ctx) {
     try {
       w.watcher = watch(dir, { recursive: true }, (event, filename) => {
         w.rev++
-        if (filename) w.pathRev.set(String(filename).replace(/\\/g, '/'), w.rev)
-        else w.fullDirtyRev = w.rev
+        const paths: string[] = []
+        if (filename) {
+          const rel = String(filename).replace(/\\/g, '/')
+          w.pathRev.set(rel, w.rev)
+          paths.push(rel)
+        } else {
+          w.fullDirtyRev = w.rev
+        }
+        // Push the change set straight to connected browsers — no polling.
+        broadcast(name, { type: 'changes', rev: w.rev, paths, full: w.fullDirtyRev === w.rev })
       })
     } catch {
       w.watcher = null
@@ -151,8 +182,67 @@ export function apply(ctx: Ctx) {
         }
       }
       watchers.clear()
+      for (const set of sockets.values()) {
+        for (const ws of set) {
+          try {
+            ws.close()
+          } catch {
+            // ignore
+          }
+        }
+      }
+      sockets.clear()
+      try {
+        wss.close()
+      } catch {
+        // ignore
+      }
     },
     'local-project: watchers cleanup',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.webServer.registerUpgrade({
+        path: '/local-project/ws',
+        handler: (req, socket, head) => {
+          const url = new URL(req.url ?? '/', 'http://x')
+          const name = sanitizeName(url.searchParams.get('name'))
+          if (!name) {
+            socket.destroy()
+            return
+          }
+          try {
+            wss.handleUpgrade(req, socket, head, (ws) => {
+              let set = sockets.get(name)
+              if (!set) {
+                set = new Set()
+                sockets.set(name, set)
+              }
+              set.add(ws)
+              ws.on('close', () => {
+                set?.delete(ws)
+                if (set && set.size === 0) sockets.delete(name)
+              })
+              ws.on('error', () => {
+                try {
+                  ws.close()
+                } catch {
+                  // ignore
+                }
+              })
+            })
+          } catch (err) {
+            ctx.logger?.error(err)
+            try {
+              socket.destroy()
+            } catch {
+              // ignore
+            }
+          }
+        },
+      }),
+    'local-project: websocket',
   )
 
   ctx.effect(
@@ -267,6 +357,18 @@ export function apply(ctx: Ctx) {
               }
               const dir = join(rootDir(), name)
               stopWatcher(name)
+              const set = sockets.get(name)
+              if (set) {
+                for (const ws of set) {
+                  try {
+                    ws.close()
+                  } catch {
+                    // ignore
+                  }
+                }
+                set.clear()
+                sockets.delete(name)
+              }
               try {
                 const ws = await ctx.workspaceRegistry.resolveByPath(dir)
                 if (ws) await ctx.workspaceRegistry.delete(ws.id)

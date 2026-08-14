@@ -10,7 +10,7 @@
 
 # DSH Local Project
 
-> Import a local folder as a server-DSH workspace (the server keeps a mirror copy). **Files sync back to your local folder only when DSH modifies them** (server `fs.watch` + browser pull) — no continuous two-way sync. Deleting a project removes only the server copy. Modeled after Grok's web "New project".
+> Import a local folder as a server-DSH workspace (the server keeps a mirror copy). **Files sync back to your local folder only when DSH modifies them** (server `fs.watch` + **WebSocket push**) — no continuous two-way sync. Deleting a project removes only the server copy. Modeled after Grok's web "New project".
 
 **Install:**
 
@@ -24,7 +24,7 @@ Restart DSH, then use the "Local project" button at the sidebar bottom.
 
 1. In the browser, click "Local project" → pick a local folder (File System Access API grants a read/write handle).
 2. The folder is **uploaded to the server** as a real workspace directory, so DSH's native `read/write/edit/glob/bash` tools work directly — no custom tools needed.
-3. **Pull-only sync (DSH → local)**: the server watches the project directory with `fs.watch`; whenever DSH changes a file it records the change, and the browser does a lightweight poll (every 2 s) and downloads those files to local. Local edits are not auto-uploaded, and local files are not scanned continuously.
+3. **Pull-only sync (DSH → local, WebSocket push)**: the server watches the project directory with `fs.watch`; the moment DSH changes a file, the server pushes the change set to the browser over WebSocket and the browser downloads only those files to local — **no polling**, changes land instantly. Disconnects auto-reconnect with exponential backoff and catch up on anything missed. Local edits are not auto-uploaded, and local files are not scanned continuously.
 4. **Deleting a project** removes only the server copy and workspace record; local files are untouched (individual file deletions are not propagated, to avoid accidental data loss).
 
 ## Usage
@@ -40,7 +40,7 @@ Restart DSH, then use the "Local project" button at the sidebar bottom.
 - **~15 MB per-file cap** (upload uses base64 JSON); keep very large files out of the project.
 - **No single-file delete propagation**: only "delete project" removes the whole server copy.
 - **Local edits are not auto-uploaded**: only the initial import uploads; afterwards the server mirror follows DSH's changes.
-- **~2 s change poll**: DSH changes reach your local folder within ~2 s; the poll only checks a change number, it does not scan local files.
+- **Real-time push needs the WebSocket connection**: DSH changes are pushed to local over WebSocket (no polling); the connection auto-reconnects and catches up on missed changes.
 - **Electron desktop window**: if the API is unavailable, open DSH's web address in a system browser.
 
 ## Architecture
@@ -48,15 +48,16 @@ Restart DSH, then use the "Local project" button at the sidebar bottom.
 - **Host half** (`src/index.ts` → `lib/index.js`):
   - `POST /local-project/create`: creates the server directory + workspace record.
   - `POST /local-project/upload`: writes/overwrites a server file (base64, binary-safe; used by the initial import).
-  - `GET /local-project/rev`: returns the project change number (for the browser's lightweight poll).
-  - `GET /local-project/pull`: returns the paths DSH changed since the last pull.
+  - `GET /local-project/rev`: returns the project change number (used to baseline the initial import).
+  - `GET /local-project/pull`: returns the paths DSH changed since the last pull (used to catch up after a reconnect).
   - `GET /local-project/manifest` / `download`: full reconcile / download a file (base64).
   - `POST /local-project/delete`: removes the server directory + workspace record.
+  - **WebSocket upgrade route `GET /local-project/ws?name=…`**: whenever `fs.watch` fires, the server pushes `{type:'changes', rev, paths, full}` to every connection of that project (the `ws` library is bundled into the plugin — no extra dependencies).
 - **Client half** (`src/client/index.tsx` → `lib/client.js`):
   - Registers the "Local project" button + import dialog in `sidebar.footer.action`.
   - Holds the local folder read/write handles (browser memory only).
-  - Uploads all files on the initial import, then polls `rev` every 2 s and pulls any DSH-changed files back to local (driven by `fs.watch`; no local scanning, no continuous two-way sync).
-  - "Delete project" calls the server delete endpoint and drops the local handle.
+  - Uploads all files on the initial import and baselines the change number; afterwards it **receives DSH changes over WebSocket** and writes only the modified files back to local (no polling; reconnect with 2 s → 30 s exponential backoff, then pull anything missed).
+  - "Delete project" calls the server delete endpoint and closes the corresponding WebSocket.
 
 ## Configuration (environment variables)
 

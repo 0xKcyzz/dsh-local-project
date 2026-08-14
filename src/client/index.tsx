@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import css from './store.css'
 
 const NS = 'sidebar.localProject'
@@ -91,6 +91,10 @@ interface ManifestEntry {
 interface SyncState {
   handle: FileSystemDirectoryHandle
   lastRev: number
+  ws: WebSocket | null
+  queue: Promise<void>
+  closed: boolean
+  reconnectTimer: number | null
 }
 
 async function resolveDir(root: FileSystemDirectoryHandle, parts: string[], create: boolean): Promise<FileSystemDirectoryHandle> {
@@ -192,6 +196,96 @@ async function fullReconcile(name: string, state: SyncState): Promise<void> {
   }
 }
 
+/** Serialize every sync step for a project so rev/lastRev updates stay ordered. */
+function enqueue(state: SyncState, fn: () => Promise<void>): void {
+  state.queue = state.queue.then(fn).catch(() => {
+    // transient errors are ignored; the next push or reconnect retries
+  })
+}
+
+/** Apply a change set ({rev, paths, full}) to the local folder, then advance lastRev. */
+async function applySync(
+  name: string,
+  state: SyncState,
+  msg: { rev: number; paths?: string[]; full?: boolean },
+): Promise<void> {
+  if (!msg || typeof msg.rev !== 'number' || msg.rev <= state.lastRev) return
+  if (msg.full) {
+    await fullReconcile(name, state)
+  } else {
+    for (const p of msg.paths || []) {
+      const dl = await getJson(
+        `/local-project/download?name=${encodeURIComponent(name)}&path=${encodeURIComponent(p)}`,
+      )
+      if (dl && dl.ok) await writeLocalFile(state.handle, p, dl.content)
+    }
+  }
+  state.lastRev = msg.rev
+}
+
+/** Pull everything changed since lastRev — used on (re)connect to catch missed pushes. */
+async function catchUp(name: string, state: SyncState): Promise<void> {
+  const pull = await getJson(
+    `/local-project/pull?name=${encodeURIComponent(name)}&since=${state.lastRev}`,
+  )
+  if (pull && pull.ok) await applySync(name, state, pull)
+}
+
+/**
+ * Open a WebSocket to the server for one project. The server pushes change
+ * notifications the moment DSH modifies a file — no polling at all. Reconnects
+ * with backoff and catches up on anything missed while disconnected.
+ */
+function attachSync(name: string, state: SyncState): void {
+  let attempt = 0
+  const connect = () => {
+    if (state.closed) return
+    let ws: WebSocket
+    try {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+      ws = new WebSocket(
+        `${proto}://${location.host}/local-project/ws?name=${encodeURIComponent(name)}`,
+      )
+    } catch {
+      schedule()
+      return
+    }
+    state.ws = ws
+    ws.onopen = () => {
+      attempt = 0
+      enqueue(state, () => catchUp(name, state))
+    }
+    ws.onmessage = (ev) => {
+      let msg: any
+      try {
+        msg = JSON.parse(ev.data as string)
+      } catch {
+        return
+      }
+      if (msg && msg.type === 'changes') {
+        enqueue(state, () => applySync(name, state, msg))
+      }
+    }
+    ws.onclose = () => {
+      if (state.ws === ws) state.ws = null
+      if (!state.closed) schedule()
+    }
+    ws.onerror = () => {
+      try {
+        ws.close()
+      } catch {
+        // ignore
+      }
+    }
+  }
+  const schedule = () => {
+    const delay = Math.min(30000, 2000 * Math.pow(2, attempt))
+    attempt++
+    state.reconnectTimer = window.setTimeout(connect, delay)
+  }
+  connect()
+}
+
 function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: any[]) => string }) {
   const { wide, t } = props
   const [open, setOpen] = useState(false)
@@ -199,40 +293,6 @@ function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: an
   const [error, setError] = useState<string | null>(null)
   const [projects, setProjects] = useState<Record<string, { name: string }>>({})
   const projectsRef = useRef<Record<string, SyncState>>({})
-
-  // Lightweight pull loop: only downloads when the server (DSH) changed files.
-  useEffect(() => {
-    const tick = async () => {
-      const entries = Object.entries(projectsRef.current)
-      for (const [pName, state] of entries) {
-        try {
-          const r = await getJson(`/local-project/rev?name=${encodeURIComponent(pName)}`)
-          if (r && r.ok && r.rev > state.lastRev) {
-            const pull = await getJson(
-              `/local-project/pull?name=${encodeURIComponent(pName)}&since=${state.lastRev}`,
-            )
-            if (pull && pull.ok) {
-              if (pull.full) {
-                await fullReconcile(pName, state)
-              } else {
-                for (const p of pull.paths || []) {
-                  const dl = await getJson(
-                    `/local-project/download?name=${encodeURIComponent(pName)}&path=${encodeURIComponent(p)}`,
-                  )
-                  if (dl && dl.ok) await writeLocalFile(state.handle, p, dl.content)
-                }
-              }
-              state.lastRev = pull.rev
-            }
-          }
-        } catch {
-          // transient — keep polling
-        }
-      }
-    }
-    const timer = setInterval(tick, 2000)
-    return () => clearInterval(timer)
-  }, [])
 
   const createProject = async () => {
     const wsName = name.trim()
@@ -257,13 +317,22 @@ function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: an
     try {
       const res = await postJson('/local-project/create', { name: wsName })
       if (!res || res.ok !== true) throw new Error(res?.error || 'create failed')
-      const state: SyncState = { handle, lastRev: 0 }
+      const state: SyncState = {
+        handle,
+        lastRev: 0,
+        ws: null,
+        queue: Promise.resolve(),
+        closed: false,
+        reconnectTimer: null,
+      }
       projectsRef.current[wsName] = state
       setProjects((prev) => ({ ...prev, [wsName]: { name: wsName } }))
       setOpen(false)
       setName('')
       window.alert(t('success', wsName))
       await importLocal(wsName, state)
+      // After the import baseline is set, the server pushes DSH changes over WS.
+      attachSync(wsName, state)
       window.alert(t('done', wsName))
     } catch (e) {
       setError(t('error') + (e instanceof Error ? e.message : String(e)))
@@ -276,6 +345,16 @@ function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: an
       await postJson('/local-project/delete', { name: wsName })
     } catch {
       // best-effort
+    }
+    const state = projectsRef.current[wsName]
+    if (state) {
+      state.closed = true
+      if (state.reconnectTimer != null) window.clearTimeout(state.reconnectTimer)
+      try {
+        state.ws?.close()
+      } catch {
+        // ignore
+      }
     }
     delete projectsRef.current[wsName]
     setProjects((prev) => {
