@@ -3,16 +3,27 @@
 </p>
 
 <p align="center">
-  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-0B7285?style=flat-square">
-  <img alt="DSH: Web" src="https://img.shields.io/badge/DeepSeek%20Harness-Web-5B4CF0?style=flat-square">
-  <img alt="Topics" src="https://img.shields.io/badge/topic-dsh--plugin-5B4CF0?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-0B7285?style=flat-square">
+  <img alt="DSH Plugin" src="https://img.shields.io/badge/DSH-Plugin-5B4CF0?style=flat-square">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Web-4B6FFF?style=flat-square">
+  <img alt="Sync" src="https://img.shields.io/badge/sync-WebSocket-00B8A9?style=flat-square">
+  <img alt="File System Access" src="https://img.shields.io/badge/API-File%20System%20Access-4B6FFF?style=flat-square">
 </p>
 
 # DSH Local Project
 
-> Import a local folder as a server-DSH workspace (the server keeps a mirror copy). **Files sync back to your local folder only when DSH modifies them** (server `fs.watch` + **WebSocket push**) — no continuous two-way sync. Deleting a project removes only the server copy. Modeled after Grok's web "New project".
+> Import a local folder as a server-DSH workspace and automatically sync DSH changes back to your local folder.
+> Ideal for letting a remote DSH read/write local code or assets from the browser while keeping a local copy.
 
-**Install:**
+## Features
+
+- Use "Add workspace" to pick a local folder; it is uploaded and mirrored as a server workspace automatically.
+- DSH uses its native `read/write/edit/glob/bash` tools directly on the server mirror — no custom tools needed.
+- DSH file changes are pushed back to local in real time over WebSocket; disconnects auto-reconnect and catch up missed changes.
+- Deleting a project removes only the server copy and workspace record; local files are not affected.
+- After a page refresh, the project list is restored from the server, and you can re-select the local folder to resume sync.
+
+## Install
 
 ```bash
 dsh plugin --profile web add github:0xKcyzz/dsh-local-project
@@ -20,45 +31,42 @@ dsh plugin --profile web add github:0xKcyzz/dsh-local-project
 
 Restart DSH, then use "Add workspace" to open the local project import dialog.
 
-## How it works (Grok model)
-
-1. In the browser, click "Add workspace" → pick a local folder (File System Access API grants a read/write handle).
-2. The folder is **uploaded to the server** as a real workspace directory, so DSH's native `read/write/edit/glob/bash` tools work directly — no custom tools needed.
-3. **Pull-only sync (DSH → local, WebSocket push)**: the server watches the project directory with `fs.watch`; the moment DSH changes a file, the server pushes the change set to the browser over WebSocket and the browser downloads only those files to local — **no polling**, changes land instantly. Disconnects auto-reconnect with exponential backoff and catch up on anything missed. Local edits are not auto-uploaded, and local files are not scanned continuously.
-4. **Deleting a project** removes only the server copy and workspace record; local files are untouched (individual file deletions are not propagated, to avoid accidental data loss).
-
 ## Usage
 
-1. After restart, click "Add workspace" in the sidebar or empty state.
-2. Enter a project name → "Choose folder & import" → select a local folder (Chrome/Edge grants access).
-3. The initial upload starts; a "Local project: <name>" workspace appears in the sidebar.
-4. Open that workspace and chat — DSH operates on the server mirror, and changes sync back to your local folder.
+1. Click "Add workspace" in the DSH sidebar or empty state.
+2. Enter a project name and click "Choose folder & import".
+3. Select a local folder in the system dialog (requires Chrome/Edge authorization).
+4. The initial import uploads your files; a "Local project: <name>" workspace appears in the sidebar.
+5. Open that workspace and chat — DSH operates on the server mirror, and file changes sync back to local automatically.
 
 ## Limitations
 
-- **Requires the File System Access API**: Chrome / Edge (Chromium-based). Firefox / Safari are not supported.
-- **~15 MB per-file cap** (upload uses base64 JSON); keep very large files out of the project.
-- **No single-file delete propagation**: only "delete project" removes the whole server copy.
-- **Local edits are not auto-uploaded**: only the initial import uploads; afterwards the server mirror follows DSH's changes.
-- **Real-time push needs the WebSocket connection**: DSH changes are pushed to local over WebSocket (no polling); the connection auto-reconnects and catches up on missed changes.
-- **Electron desktop window**: if the API is unavailable, open DSH's web address in a system browser.
+- Requires the File System Access API: Chrome / Edge (Chromium-based). Firefox / Safari are not supported.
+- Per-file cap is about 15 MB (upload uses base64 JSON); keep very large files out of the project.
+- Single-file deletions are not propagated: only "delete project" removes the whole server copy.
+- Local edits are not auto-uploaded: only the initial import uploads; later local changes are not synced to the server.
+- Real-time push requires an active WebSocket connection; it auto-reconnects and catches up on missed changes.
+- If the Electron desktop window does not support the API, open the DSH web address in a system browser.
 
-## Architecture
+## How it works
 
-- **Host half** (`src/index.ts` → `lib/index.js`):
-  - `POST /local-project/create`: creates the server directory + workspace record.
-  - `POST /local-project/upload`: writes/overwrites a server file (base64, binary-safe; used by the initial import).
-  - `GET /local-project/rev`: returns the project change number (used to baseline the initial import).
-  - `GET /local-project/pull`: returns the paths DSH changed since the last pull (used to catch up after a reconnect).
-  - `GET /local-project/list`: lists server mirror directories (used to refresh imported projects).
-  - `GET /local-project/manifest` / `download`: full reconcile / download a file (base64).
-  - `POST /local-project/delete`: removes the server directory + workspace record.
-  - **WebSocket upgrade route `GET /local-project/ws?name=…`**: whenever `fs.watch` fires, the server pushes `{type:'changes', rev, paths, full}` to every connection of that project (`ws` is a runtime dependency).
-- **Client half** (`src/client/index.tsx` → `lib/client.js`):
-  - Fills `conversation.hero.workspace.directoryFlow` / `sidebar.workspaces.directoryFlow`, so "Add workspace" opens the local project import dialog.
-  - Holds the local folder read/write handles (browser memory only).
-  - Uploads all files on the initial import and baselines the change number; afterwards it **receives DSH changes over WebSocket** and writes only the modified files back to local (no polling; reconnect with 2 s → 30 s exponential backoff, then pull anything missed).
-  - "Delete project" calls the server delete endpoint and closes the corresponding WebSocket.
+- **Host side**: provides `/local-project/*` HTTP endpoints and WebSocket push; creates/uploads/deletes the server mirror and watches file changes with `fs.watch`.
+- **Client side**: fills DSH's "Add workspace" directory flow; picks the local folder, uploads files, receives WebSocket changes, and writes them back locally.
+- Sync direction is **DSH → local**: server changes are pushed over WebSocket, and the browser downloads only changed files; there is no continuous two-way sync.
+
+### Host endpoints
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /local-project/create` | Create server directory + workspace record |
+| `POST /local-project/upload` | Upload/overwrite a server file (base64) |
+| `GET /local-project/rev` | Get project change revision |
+| `GET /local-project/pull` | Get changes missed while disconnected |
+| `GET /local-project/list` | List server mirror projects |
+| `GET /local-project/manifest` | Get server file manifest |
+| `GET /local-project/download` | Download a server file (base64) |
+| `POST /local-project/delete` | Delete server directory + workspace record |
+| `GET /local-project/ws` | WebSocket real-time change push |
 
 ## Configuration (environment variables)
 

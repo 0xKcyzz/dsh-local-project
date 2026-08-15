@@ -1,14 +1,19 @@
 {
   "name": "dsh-local-project",
   "version": "0.1.0",
-  "description": "DSH 本地项目：把本地电脑的文件夹上传到服务器 DSH 并创建为工作区，让远程部署的 DSH 能直接操作本地项目。",
+  "description": "DSH plugin: import a local folder as a server workspace and sync DSH changes back to local.",
   "keywords": [
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
     "local-project",
     "workspace",
-    "remote"
+    "remote",
+    "sync",
+    "websocket",
+    "file-system-access",
+    "local-files",
+    "browser"
   ],
   "type": "module",
   "main": "lib/index.js",
