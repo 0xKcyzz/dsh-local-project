@@ -15,7 +15,7 @@
 **安装：**
 
 ```bash
-dsh plugin --profile web add github:w769721503/dsh-local-project
+dsh plugin --profile web add github:0xKcyzz/dsh-local-project
 ```
 
 安装后**重启 DSH**，侧边栏底部出现「本地项目」按钮。
