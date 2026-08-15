@@ -130,3 +130,16 @@
   color: var(--dsw-alias-label-tertiary, #999);
   font-size: 12px;
 }
+
+.lp-project-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.lp-actions button:disabled,
+.lp-project-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

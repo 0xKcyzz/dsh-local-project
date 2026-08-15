@@ -1,7 +1,8 @@
-import { useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import css from './store.css'
 
 const NS = 'sidebar.localProject'
+const STORAGE_KEY = 'dsh-local-project.projects'
 
 const zh = {
   label: '本地项目',
@@ -18,6 +19,8 @@ const zh = {
   deleteConfirm: (n: string) => `确定删除服务器上的本地项目「${n}」？服务器副本会被删除，本地文件不受影响。`,
   empty: '尚未导入任何本地项目',
   importing: '正在上传文件…',
+  resume: '重新选择文件夹并恢复同步',
+  resuming: '正在恢复同步…',
 }
 
 const en = {
@@ -35,6 +38,8 @@ const en = {
   deleteConfirm: (n: string) => `Delete the server copy of "${n}"? Local files are not affected.`,
   empty: 'No local projects imported',
   importing: 'Uploading files…',
+  resume: 'Choose folder & resume sync',
+  resuming: 'Resuming sync…',
 }
 
 interface Ctx {
@@ -49,6 +54,18 @@ interface Ctx {
   effect(disposer: () => () => void, label?: string): void
 }
 
+interface DirectoryFlowOwnerProps {
+  open: boolean
+  busy: boolean
+  onPicked: (path: string) => void
+  onCancel: () => void
+  onError: (message: string) => void
+}
+
+interface LocalProjectFlowProps extends DirectoryFlowOwnerProps {
+  t: (key: string, ...args: any[]) => string
+}
+
 export const inject = ['slots', 'locale']
 
 export function apply(ctx: Ctx) {
@@ -56,18 +73,28 @@ export function apply(ctx: Ctx) {
   const t = ctx.locale.bind(NS)
   ctx.effect(() => injectCss(), 'local-project: css')
 
-  ctx.slots.inject('sidebar.footer.action', () =>
-    ctx.slots.register(
-      {
-        name: 'sidebar.footer.action',
-        id: 'local-project',
-        order: 20,
-        label: () => t('label'),
-        locale: NS,
-        inject: () => ({ t }),
-      },
-      LocalProjectAction,
-    ),
+  const injected = () => ({ t })
+
+  // Fill ui-workspace's directory-flow holes. Occupying these holes makes the
+  // native "添加工作区" button appear in the sidebar and empty-state picker, and
+  // clicking it opens this plugin's local-folder import dialog.
+  ctx.slots.inject('conversation.hero.workspace.directoryFlow', () =>
+    ctx.slots.inject('sidebar.workspaces.directoryFlow', function* () {
+      yield ctx.slots.register(
+        {
+          name: 'conversation.hero.workspace.directoryFlow',
+          inject: injected,
+        },
+        LocalProjectFlow,
+      )
+      yield ctx.slots.register(
+        {
+          name: 'sidebar.workspaces.directoryFlow',
+          inject: injected,
+        },
+        LocalProjectFlow,
+      )
+    }),
   )
 }
 
@@ -88,6 +115,11 @@ interface ManifestEntry {
   mtimeMs: number
 }
 
+interface ProjectMeta {
+  name: string
+  dir?: string
+}
+
 interface SyncState {
   handle: FileSystemDirectoryHandle
   lastRev: number
@@ -95,6 +127,87 @@ interface SyncState {
   queue: Promise<void>
   closed: boolean
   reconnectTimer: number | null
+}
+
+// Module-level registries keep sync alive even if the directory-flow component
+// is mounted by both sidebar and hero surfaces, or remounts while the modal is
+// closed.
+const activeSyncs = new Map<string, SyncState>()
+
+let projectMetas: ProjectMeta[] = []
+try {
+  if (typeof localStorage !== 'undefined') {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) projectMetas = parsed.filter((x) => x && typeof x.name === 'string')
+    }
+  }
+} catch {
+  // ignore storage errors
+}
+
+const projectListeners = new Set<() => void>()
+
+function emitProjects(): void {
+  for (const listener of [...projectListeners]) listener()
+}
+
+function saveProjects(): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(projectMetas))
+    }
+  } catch {
+    // ignore storage errors
+  }
+  emitProjects()
+}
+
+function addProjectMeta(meta: ProjectMeta): void {
+  if (projectMetas.some((p) => p.name === meta.name)) return
+  projectMetas = [...projectMetas, meta]
+  saveProjects()
+}
+
+function removeProjectMeta(name: string): void {
+  projectMetas = projectMetas.filter((p) => p.name !== name)
+  saveProjects()
+}
+
+function useProjects(): ProjectMeta[] {
+  const [projects, setProjects] = useState<ProjectMeta[]>(projectMetas)
+  useEffect(() => {
+    const listener = () => setProjects(projectMetas)
+    projectListeners.add(listener)
+    return () => {
+      projectListeners.delete(listener)
+    }
+  }, [])
+  useEffect(() => {
+    let alive = true
+    // Make server-side projects visible even if this browser's localStorage was
+    // cleared, so the delete-server-project action remains available.
+    getJson('/local-project/list')
+      .then((data) => {
+        if (!alive || !data || !Array.isArray(data.projects)) return
+        let changed = false
+        for (const item of data.projects) {
+          if (item && typeof item.name === 'string' && !projectMetas.some((p) => p.name === item.name)) {
+            projectMetas = [...projectMetas, { name: item.name }]
+            changed = true
+          }
+        }
+        if (changed) saveProjects()
+      })
+      .catch(() => {
+        // The host may be starting; localStorage still lists known projects.
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+  return projects
 }
 
 async function resolveDir(root: FileSystemDirectoryHandle, parts: string[], create: boolean): Promise<FileSystemDirectoryHandle> {
@@ -154,7 +267,16 @@ async function writeLocalFile(handle: FileSystemDirectoryHandle, path: string, b
 
 async function getJson(url: string): Promise<any> {
   const res = await fetch(url)
-  return res.json()
+  let payload: any
+  try {
+    payload = await res.json()
+  } catch {
+    throw new Error(`HTTP ${res.status}`)
+  }
+  if (!res.ok || !payload || payload.ok !== true) {
+    throw new Error(payload?.error || `HTTP ${res.status}`)
+  }
+  return payload
 }
 
 async function postJson(url: string, data: unknown): Promise<any> {
@@ -163,7 +285,16 @@ async function postJson(url: string, data: unknown): Promise<any> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(data),
   })
-  return res.json()
+  let payload: any
+  try {
+    payload = await res.json()
+  } catch {
+    throw new Error(`HTTP ${res.status}`)
+  }
+  if (!res.ok || !payload || payload.ok !== true) {
+    throw new Error(payload?.error || `HTTP ${res.status}`)
+  }
+  return payload
 }
 
 /** Initial import: upload every local file, then consume the rev. */
@@ -175,7 +306,7 @@ async function importLocal(name: string, state: SyncState): Promise<void> {
     await postJson('/local-project/upload', { name, path: p, content })
   }
   const r = await getJson(`/local-project/rev?name=${encodeURIComponent(name)}`)
-  state.lastRev = r && r.ok ? r.rev : 0
+  state.lastRev = r && r.rev ? r.rev : 0
 }
 
 /** Full reconcile (fallback when a directory rename/delete event lost filenames): download server files that differ. */
@@ -286,13 +417,34 @@ function attachSync(name: string, state: SyncState): void {
   connect()
 }
 
-function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: any[]) => string }) {
-  const { wide, t } = props
-  const [open, setOpen] = useState(false)
+function closeSync(name: string): void {
+  const state = activeSyncs.get(name)
+  if (!state) return
+  state.closed = true
+  if (state.reconnectTimer != null) window.clearTimeout(state.reconnectTimer)
+  try {
+    state.ws?.close()
+  } catch {
+    // ignore
+  }
+  activeSyncs.delete(name)
+}
+
+function pickDirectory(): Promise<FileSystemDirectoryHandle> {
+  const picker = (window as any).showDirectoryPicker
+  if (typeof picker !== 'function') {
+    return Promise.reject(new Error('noApi'))
+  }
+  return picker.call(window, { mode: 'readwrite' }) as Promise<FileSystemDirectoryHandle>
+}
+
+function LocalProjectFlow(props: LocalProjectFlowProps) {
+  const { open, busy, onPicked, onCancel, t } = props
   const [name, setName] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [projects, setProjects] = useState<Record<string, { name: string }>>({})
-  const projectsRef = useRef<Record<string, SyncState>>({})
+  const [importing, setImporting] = useState(false)
+  const [resuming, setResuming] = useState<string | null>(null)
+  const projects = useProjects()
 
   const createProject = async () => {
     const wsName = name.trim()
@@ -300,23 +452,19 @@ function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: an
       setError(t('nameLabel') + ' 不能为空')
       return
     }
+    if (importing || busy) return
     setError(null)
-    const picker = (window as any).showDirectoryPicker
-    if (typeof picker !== 'function') {
-      setError(t('noApi'))
-      return
-    }
     let handle: FileSystemDirectoryHandle
     try {
-      handle = await picker.call(window, { mode: 'readwrite' })
+      handle = await pickDirectory()
     } catch (e) {
-      setError(t('error') + (e instanceof Error ? e.message : String(e)))
+      const message = e instanceof Error && e.message === 'noApi' ? t('noApi') : e instanceof Error ? e.message : String(e)
+      setError(message)
       return
     }
-    setError(null)
+    setImporting(true)
     try {
       const res = await postJson('/local-project/create', { name: wsName })
-      if (!res || res.ok !== true) throw new Error(res?.error || 'create failed')
       const state: SyncState = {
         handle,
         lastRev: 0,
@@ -325,92 +473,149 @@ function LocalProjectAction(props: { wide: boolean; t: (key: string, ...args: an
         closed: false,
         reconnectTimer: null,
       }
-      projectsRef.current[wsName] = state
-      setProjects((prev) => ({ ...prev, [wsName]: { name: wsName } }))
-      setOpen(false)
-      setName('')
-      window.alert(t('success', wsName))
+      activeSyncs.set(wsName, state)
       await importLocal(wsName, state)
-      // After the import baseline is set, the server pushes DSH changes over WS.
       attachSync(wsName, state)
-      window.alert(t('done', wsName))
+      addProjectMeta({ name: wsName, dir: res.dir || '' })
+      setImporting(false)
+      setName('')
+      onPicked(res.dir || '')
     } catch (e) {
+      // Roll back the server-side mirror if we created it but failed to upload.
+      try {
+        await postJson('/local-project/delete', { name: wsName })
+      } catch {
+        // best-effort cleanup
+      }
+      closeSync(wsName)
+      setImporting(false)
+      setError(t('error') + (e instanceof Error ? e.message : String(e)))
+    }
+  }
+
+  const resumeProject = async (meta: ProjectMeta) => {
+    if (activeSyncs.has(meta.name) || resuming) return
+    setError(null)
+    let handle: FileSystemDirectoryHandle
+    try {
+      handle = await pickDirectory()
+    } catch (e) {
+      const message = e instanceof Error && e.message === 'noApi' ? t('noApi') : e instanceof Error ? e.message : String(e)
+      setError(message)
+      return
+    }
+    setResuming(meta.name)
+    try {
+      const state: SyncState = {
+        handle,
+        lastRev: 0,
+        ws: null,
+        queue: Promise.resolve(),
+        closed: false,
+        reconnectTimer: null,
+      }
+      activeSyncs.set(meta.name, state)
+      const rev = await getJson(`/local-project/rev?name=${encodeURIComponent(meta.name)}`)
+      state.lastRev = rev && rev.rev ? rev.rev : 0
+      await fullReconcile(meta.name, state)
+      attachSync(meta.name, state)
+      setResuming(null)
+    } catch (e) {
+      closeSync(meta.name)
+      setResuming(null)
       setError(t('error') + (e instanceof Error ? e.message : String(e)))
     }
   }
 
   const removeProject = async (wsName: string) => {
     if (!window.confirm(t('deleteConfirm', wsName))) return
+    setError(null)
     try {
       await postJson('/local-project/delete', { name: wsName })
-    } catch {
-      // best-effort
+      closeSync(wsName)
+      removeProjectMeta(wsName)
+    } catch (e) {
+      setError(t('error') + (e instanceof Error ? e.message : String(e)))
     }
-    const state = projectsRef.current[wsName]
-    if (state) {
-      state.closed = true
-      if (state.reconnectTimer != null) window.clearTimeout(state.reconnectTimer)
-      try {
-        state.ws?.close()
-      } catch {
-        // ignore
-      }
-    }
-    delete projectsRef.current[wsName]
-    setProjects((prev) => {
-      const next = { ...prev }
-      delete next[wsName]
-      return next
-    })
   }
 
-  const projectList = Object.values(projects)
+  if (!open) return null
 
   return (
     <div className="lp-root">
-      <button type="button" className="lp-trigger" title={t('label')} onClick={() => setOpen(true)}>
-        {wide ? t('label') : '📁'}
-      </button>
+      <div className="lp-backdrop" onClick={() => {
+        if (!importing && !resuming && !busy) onCancel()
+      }}>
+        <div className="lp-modal" onClick={(e) => e.stopPropagation()}>
+          <h4>{t('modalTitle')}</h4>
+          <p className="lp-hint">{t('hint')}</p>
 
-      {open ? (
-        <div className="lp-backdrop" onClick={() => setOpen(false)}>
-          <div className="lp-modal" onClick={(e) => e.stopPropagation()}>
-            <h4>{t('modalTitle')}</h4>
-            <p className="lp-hint">{t('hint')}</p>
+          <label className="lp-field">
+            <span>{t('nameLabel')}</span>
+            <input
+              value={name}
+              disabled={importing || busy}
+              onChange={(e) => setName(e.currentTarget.value)}
+            />
+          </label>
 
-            <label className="lp-field">
-              <span>{t('nameLabel')}</span>
-              <input value={name} onChange={(e) => setName(e.currentTarget.value)} />
-            </label>
+          {error ? <p className="lp-error">{error}</p> : null}
 
-            {error ? <p className="lp-error">{error}</p> : null}
+          <div className="lp-actions">
+            <button
+              type="button"
+              className="lp-primary"
+              disabled={importing || resuming !== null || busy}
+              onClick={createProject}
+            >
+              {importing ? t('importing') : t('create')}
+            </button>
+            <button
+              type="button"
+              className="lp-secondary"
+              disabled={importing || resuming !== null || busy}
+              onClick={() => onCancel()}
+            >
+              {t('cancel')}
+            </button>
+          </div>
 
-            <div className="lp-actions">
-              <button type="button" className="lp-primary" onClick={createProject}>
-                {t('create')}
-              </button>
-              <button type="button" className="lp-secondary" onClick={() => setOpen(false)}>
-                {t('cancel')}
-              </button>
-            </div>
-
-            {projectList.length > 0 ? (
-              <ul className="lp-projects">
-                {projectList.map((p) => (
+          {projects.length > 0 ? (
+            <ul className="lp-projects">
+              {projects.map((p) => {
+                const synced = activeSyncs.has(p.name)
+                return (
                   <li key={p.name} className="lp-project">
                     <span className="lp-project-name">📁 {p.name}</span>
-                    <button type="button" className="lp-danger" onClick={() => removeProject(p.name)}>
-                      {t('deleteProject')}
-                    </button>
+                    <div className="lp-project-actions">
+                      {!synced ? (
+                        <button
+                          type="button"
+                          className="lp-secondary"
+                          disabled={importing || resuming === p.name || busy}
+                          onClick={() => resumeProject(p)}
+                        >
+                          {resuming === p.name ? t('resuming') : t('resume')}
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="lp-danger"
+                        disabled={importing || resuming === p.name || busy}
+                        onClick={() => removeProject(p.name)}
+                      >
+                        {t('deleteProject')}
+                      </button>
+                    </div>
                   </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="lp-empty">{t('empty')}</p>
-            )}
-          </div>
+                )
+              })}
+            </ul>
+          ) : (
+            <p className="lp-empty">{t('empty')}</p>
+          )}
         </div>
-      ) : null}
+      </div>
     </div>
   )
 }

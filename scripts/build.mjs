@@ -16,7 +16,7 @@ await build({
   outfile: 'lib/index.js',
   sourcemap: false,
   // DSH packages resolve at runtime from the profile tree.
-  external: ['@deepseek-ai/*', 'bufferutil', 'utf-8-validate'],
+  external: ['@deepseek-ai/*', 'bufferutil', 'utf-8-validate', 'ws'],
   logLevel: 'info',
 })
 

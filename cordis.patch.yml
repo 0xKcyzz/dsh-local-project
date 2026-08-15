@@ -1,6 +1,6 @@
 # dsh-local-project bundle patch: one dual-face row — the node half registers
 # /local-project/* upload routes; the `dsh.client` declaration serves the
-# browser half, which adds the "本地项目" action to the sidebar footer.
+# browser half, which adds the local-project import dialog to the "添加工作区" flow.
 - insert:
     - id: local-project
       name: 'dsh-local-project'

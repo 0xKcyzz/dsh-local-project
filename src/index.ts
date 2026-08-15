@@ -273,7 +273,7 @@ export function apply(ctx: Ctx) {
                 await ctx.workspaceRegistry.create(dir, `本地项目: ${name}`)
               }
               ensureWatcher(name, dir)
-              sendJson(res, 200, { ok: true, name })
+              sendJson(res, 200, { ok: true, name, dir })
               return
             }
 
@@ -319,6 +319,21 @@ export function apply(ctx: Ctx) {
               }
               const full = (w?.fullDirtyRev ?? 0) > since
               sendJson(res, 200, { ok: true, rev, paths, full })
+              return
+            }
+
+            if (pathname === '/local-project/list' && req.method === 'GET') {
+              const root = rootDir()
+              const projects: { name: string }[] = []
+              if (existsSync(root)) {
+                for (const entry of readdirSync(root, { withFileTypes: true })) {
+                  if (entry.isDirectory()) {
+                    const name = sanitizeName(entry.name)
+                    if (name) projects.push({ name })
+                  }
+                }
+              }
+              sendJson(res, 200, { ok: true, projects })
               return
             }
 
@@ -372,8 +387,16 @@ export function apply(ctx: Ctx) {
               try {
                 const ws = await ctx.workspaceRegistry.resolveByPath(dir)
                 if (ws) await ctx.workspaceRegistry.delete(ws.id)
-              } catch {
-                // workspace may already be gone
+              } catch (err) {
+                // If the mirror directory is already gone there is no
+                // workspace registration left to delete. Real deletion
+                // failures should surface to the client instead of pretending
+                // the server project was removed.
+                if (!existsSync(dir)) {
+                  ctx.logger?.warn(err)
+                } else {
+                  throw err
+                }
               }
               rmSync(dir, { recursive: true, force: true })
               sendJson(res, 200, { ok: true })
