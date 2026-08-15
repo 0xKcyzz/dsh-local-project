@@ -15,7 +15,7 @@
 **Install:**
 
 ```bash
-dsh plugin --profile web add github:w769721503/dsh-local-project
+dsh plugin --profile web add github:0xKcyzz/dsh-local-project
 ```
 
 Restart DSH, then use the "Local project" button at the sidebar bottom.
